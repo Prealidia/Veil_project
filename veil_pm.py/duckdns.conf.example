@@ -1,0 +1,17 @@
+# Configurazione di duckdns.sh per l'hub Veil 2.
+# Copialo in /etc/veil2/duckdns.conf e riempi i due valori.
+#
+#   sudo install -m 0600 duckdns.conf.example /etc/veil2/duckdns.conf
+#   sudo nano /etc/veil2/duckdns.conf
+#
+# Il token lo trovi su https://www.duckdns.org accedendo: e' la stringa
+# lunga tipo "abcdef01-2345-6789-abcd-ef0123456789".
+
+# token DuckDNS, con i trattini
+DUCKDNS_TOKEN="abcdef01-2345-6789-abcd-ef0123456789"
+
+# nome del dominio, SENZA .duckdns.org
+DUCKDNS_DOMAIN="miohub"
+
+# dove tenere l'ultimo IP letto, per non scrivere il log se non cambia
+DUCKDNS_VEDUTO="/var/lib/veil2/duckdns.ultimo"

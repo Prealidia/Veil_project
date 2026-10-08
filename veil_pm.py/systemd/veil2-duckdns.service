@@ -1,0 +1,26 @@
+[Unit]
+Description=Aggiorna IP pubblico su DuckDNS
+After=network-online.target
+Wants=network-online.target
+# Niente token nelle variabili d'ambiente: restano solo in
+# /etc/veil2/duckdns.conf, che lo script legge da solo.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/duckdns.sh
+User=veil2
+Group=veil2
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/veil2
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

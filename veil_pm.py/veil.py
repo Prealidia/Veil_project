@@ -1,0 +1,1129 @@
+#!/usr/bin/env python3
+import argparse
+import codecs
+import ctypes
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import re
+import select
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from base64 import urlsafe_b64encode, urlsafe_b64decode
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import readline
+except ImportError:
+    pass
+
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+PORT = 50000
+BUFFER_SIZE = 65536
+CHUNK_SIZE = 1024 * 1024
+MAX_CHUNK_TOKEN = CHUNK_SIZE + 4096
+MAX_MSG_SIZE = 1024 * 1024
+SOCKET_TIMEOUT = 120
+ARGON2_TEMPO = 3
+ARGON2_MEMORIA_KIB = 65536
+ARGON2_PARALLELISMO = 4
+DROP_DIR = Path.home() / "localdrop"
+MESSAGGI_DIR = DROP_DIR / "messaggi"
+SECURITY_LOG = Path.home() / ".local" / "state" / "chatdefender" / "sicurezza.log"
+
+# Versione del protocollo di handshake: deve coincidere sui due PC
+VERSIONE_PROTOCOLLO = 4
+
+# Proof-of-work: l'iniziatore deve trovare un nonce tale che
+# sha256(prefisso+sfida+nonce) abbia DIFFICOLTA_POW zeri binari in testa,
+# altrimenti il server non spreca i suoi 64MB di argon2
+DIFFICOLTA_POW = 17
+
+# Prima dell'autenticazione niente gentilezze: timeout corto per chi si fa
+# desiderare (dopo l'handshake vale il timeout pieno, serve ai file grandi)
+TIMEOUT_PRE_AUTH = 30
+
+# Mini-ban: dopo TENTATIVI_BAN rifiuti in DURATA_BAN secondi l'IP viene bloccato
+TENTATIVI_BAN = 5
+DURATA_BAN = 600
+
+# Massimo di handshake contemporanei: ogni argon2id occupa 64MB, meglio non farli
+# tutti in parallelo o bastano poche connessioni per soffocare la macchina
+SEM_HANDSHAKE = threading.Semaphore(3)
+
+# I messaggi vengono gonfiati fino alla soglia successiva per nascondere le lunghezze
+PADDING_SOGLIE = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+                  131072, 262144, 524288]
+
+CONFIG_DIR = Path.home() / ".config" / "localdrop"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+IDENTITY_FILE = CONFIG_DIR / "identity.key"
+PEER_IDENTITY_FILE = CONFIG_DIR / "peer_identity.key"
+PASSWORD_FILE = CONFIG_DIR / "password"
+LOG_SALT_FILE = CONFIG_DIR / "log_salt"
+KDF_FILE = CONFIG_DIR / "kdf"
+
+STATO_INPUT = {"bozza": "", "attivo": False}
+LOCK_OUTPUT = threading.Lock()
+RE_CONTROLLO = re.compile(
+    r"\x1b\[[0-9;:?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|[\x00-\x1f\x7f]"
+)
+PASSWORD_GLOBALE = ""
+AVVISO_KDF = False
+
+# Stato del mini-ban: tentativi di rifiuto per IP e scadenze dei ban attivi
+# (solo in memoria: si azzera al riavvio)
+BAN = {"tentativi": {}, "scadenze": {}}
+LOCK_BAN = threading.Lock()
+
+# Fernet per i log dei messaggi, derivato dalla passphrase (creazione pigra)
+CHIAVE_LOG = None
+CHIAVE_IDENTITA = None
+LOCK_CHIAVE_LOG = threading.Lock()
+
+
+def _radice_con(metodo, sale):
+    segreto = PASSWORD_GLOBALE.encode()
+    if metodo == "argon2id":
+        return argon2id(segreto, sale)
+    return hashlib.pbkdf2_hmac("sha256", segreto, sale, 600_000)
+
+
+def _ricifra_log_con(fernet_log_vecchio):
+    if not MESSAGGI_DIR.exists():
+        return
+    lasciate = 0
+    nuovo_fernet = ottieni_chiave_log()
+    for cronologia in sorted(MESSAGGI_DIR.glob("*.log")):
+        uscita = []
+        for riga in cronologia.read_text().splitlines():
+            try:
+                uscita.append(nuovo_fernet.encrypt(fernet_log_vecchio.decrypt(riga.encode())).decode())
+            except (InvalidToken, ValueError):
+                uscita.append(riga)
+                lasciate += 1
+        scrivi_privato(cronologia, ("\n".join(uscita) + "\n").encode())
+    if lasciate:
+        print(f"[!] {lasciate} lines not re-encrypted, left as they were")
+
+
+def riallinea_identita(dati):
+    sale = LOG_SALT_FILE.read_bytes() if LOG_SALT_FILE.exists() else os.urandom(16)
+    attivo = kdf_attivo()
+    ordine = [attivo] + [m for m in ("argon2id", "pbkdf2") if m != attivo]
+    global CHIAVE_LOG, CHIAVE_IDENTITA
+    for metodo in ordine:
+        radice = _radice_con(metodo, sale)
+        if radice is None:
+            continue
+        chiave_id = Fernet(urlsafe_b64encode(sottochiave_hkdf(radice, b"chatdefender-identita")))
+        try:
+            privata = chiave_id.decrypt(dati)
+        except InvalidToken:
+            continue
+        if metodo != attivo:
+            scrivi_privato(KDF_FILE, (metodo + "\n").encode())
+            CHIAVE_LOG = None
+            CHIAVE_IDENTITA = None
+            scrivi_privato(IDENTITY_FILE, ottieni_chiave_identita().encrypt(privata) + b"\n")
+            print(f"[!] Environment changed: local KDF switched back to {metodo}, identity re-encrypted")
+            _ricifra_log_con(Fernet(urlsafe_b64encode(radice)))
+        return privata
+    return None
+
+
+def prepara_cartella_config():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_DIR.chmod(0o700)
+    except OSError:
+        pass
+
+
+def scrivi_privato(percorso, dati):
+    prepara_cartella_config()
+    fd = os.open(percorso, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(dati)
+
+
+def kdf_attivo():
+    scelta = os.environ.get("CHATDEFENDER_KDF")
+    if scelta in ("argon2id", "pbkdf2"):
+        return scelta
+    prepara_cartella_config()
+    if KDF_FILE.exists():
+        salvato = KDF_FILE.read_text().strip()
+        if salvato in ("argon2id", "pbkdf2"):
+            return salvato
+    try:
+        ctypes.CDLL("libargon2.so.1")
+        scelta = "argon2id"
+    except OSError:
+        scelta = "pbkdf2"
+    scrivi_privato(KDF_FILE, (scelta + "\n").encode())
+    return scelta
+
+
+def radice_kdf(sale):
+    segreto = PASSWORD_GLOBALE.encode()
+    if kdf_attivo() == "argon2id":
+        chiave = argon2id(segreto, sale)
+        if chiave is not None:
+            return chiave
+        avvisa("[!] libargon2 is missing but the data is encrypted with argon2: PBKDF2 will not decrypt it!")
+    return hashlib.pbkdf2_hmac("sha256", segreto, sale, 600_000)
+
+
+def sottochiave_hkdf(radice, info):
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(radice)
+
+
+def sanifica(testo):
+    return RE_CONTROLLO.sub(" ", testo)
+
+
+def ridisegna_input():
+    sys.stdout.write(f"\r\x1b[2K> {STATO_INPUT['bozza']}")
+    sys.stdout.flush()
+
+
+def avvisa(testo):
+    with LOCK_OUTPUT:
+        sys.stdout.write("\r\x1b[2K\n" + testo + "\n")
+        if STATO_INPUT["attivo"]:
+            ridisegna_input()
+        sys.stdout.flush()
+
+
+def scarta_sequenza(fd):
+    while True:
+        pronto, _, _ = select.select([fd], [], [], 0.05)
+        if not pronto:
+            return False
+        byte = os.read(fd, 1)
+        if byte and 0x40 <= byte[0] <= 0x7E:
+            return True
+
+
+def attiva_input_raw():
+    try:
+        fd = sys.stdin.fileno()
+        STATO_INPUT["salvate"] = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        STATO_INPUT["attivo"] = True
+        STATO_INPUT["raw"] = True
+    except (termios.error, ValueError):
+        STATO_INPUT["raw"] = False
+
+
+def ripristina_input():
+    if STATO_INPUT.get("raw"):
+        fd = sys.stdin.fileno()
+        if STATO_INPUT.get("salvate"):
+            termios.tcsetattr(fd, termios.TCSADRAIN, STATO_INPUT["salvate"])
+    STATO_INPUT["attivo"] = False
+    STATO_INPUT["bozza"] = ""
+
+
+def completa_percorso():
+    with LOCK_OUTPUT:
+        bozza = STATO_INPUT["bozza"]
+        parti = bozza.rsplit(" ", 1)
+        token = parti[-1]
+        if not token:
+            return
+        citato = token.startswith('"')
+        espanso = os.path.expanduser(token.strip('"'))
+        head, sep, prefisso = espanso.rpartition("/")
+        if sep:
+            cartella_str = (head + sep) if head else "/"
+        else:
+            cartella_str, prefisso = ".", espanso
+        try:
+            corrispondenze = sorted(Path(cartella_str).glob(prefisso + "*"))
+        except (OSError, ValueError):
+            return
+        if not corrispondenze:
+            return
+        nomi = [c.name + ("/" if c.is_dir() else "") for c in corrispondenze]
+        comune = os.path.commonprefix(nomi)
+        completato = cartella_str + comune
+        if " " in completato or citato:
+            completato = '"' + completato + '"'
+        STATO_INPUT["bozza"] = parti[0] + " " + completato if len(parti) > 1 else completato
+        ridisegna_input()
+        if len(corrispondenze) > 1:
+            anteprima = "  ".join(nomi[:15]) + (" ..." if len(nomi) > 15 else "")
+            sys.stdout.write("\n" + anteprima + "\n")
+            ridisegna_input()
+        sys.stdout.flush()
+
+
+def leggi_riga():
+    if not STATO_INPUT.get("raw"):
+        return input(">>> ")
+    fd = sys.stdin.fileno()
+    decodificatore = codecs.getincrementaldecoder("utf-8")()
+    stato_esc = 0
+    while True:
+        dati = os.read(fd, 256)
+        if not dati:
+            raise EOFError
+        for carattere in decodificatore.decode(dati):
+            if stato_esc == 2:
+                if 0x40 <= ord(carattere) <= 0x7E:
+                    stato_esc = 0
+                continue
+            if stato_esc == 1:
+                stato_esc = 2 if carattere in ("[", "O") else 0
+                continue
+            if carattere in ("\r", "\n"):
+                with LOCK_OUTPUT:
+                    riga = STATO_INPUT["bozza"]
+                    STATO_INPUT["bozza"] = ""
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                return riga
+            if carattere in ("\x7f", "\x08"):
+                with LOCK_OUTPUT:
+                    STATO_INPUT["bozza"] = STATO_INPUT["bozza"][:-1]
+                    ridisegna_input()
+            elif carattere == "\x1b":
+                stato_esc = 1
+            elif carattere == "\x03":
+                raise KeyboardInterrupt
+            elif carattere == "\x04":
+                raise EOFError
+            elif carattere == "\t":
+                completa_percorso()
+            elif carattere >= " ":
+                with LOCK_OUTPUT:
+                    STATO_INPUT["bozza"] += carattere
+                    ridisegna_input()
+        if stato_esc != 0 and not scarta_sequenza(fd):
+            stato_esc = 0
+
+
+def banner():
+    try:
+        subprocess.run(["figlet", "-f", "slant", "Veil"])
+    except FileNotFoundError:
+        print("V E I L")
+
+
+def ottieni_chiave_log():
+    global CHIAVE_LOG
+    if CHIAVE_LOG is not None:
+        return CHIAVE_LOG
+    with LOCK_CHIAVE_LOG:
+        if CHIAVE_LOG is not None:
+            return CHIAVE_LOG
+        LOG_SALT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_SALT_FILE.exists():
+            sale = LOG_SALT_FILE.read_bytes()
+        else:
+            sale = os.urandom(16)
+            scrivi_privato(LOG_SALT_FILE, sale)
+        CHIAVE_LOG = Fernet(urlsafe_b64encode(radice_kdf(sale)))
+        return CHIAVE_LOG
+
+
+def ottieni_chiave_identita():
+    global CHIAVE_IDENTITA
+    if CHIAVE_IDENTITA is not None:
+        return CHIAVE_IDENTITA
+    with LOCK_CHIAVE_LOG:
+        if CHIAVE_IDENTITA is not None:
+            return CHIAVE_IDENTITA
+        if LOG_SALT_FILE.exists():
+            sale = LOG_SALT_FILE.read_bytes()
+        else:
+            sale = os.urandom(16)
+            scrivi_privato(LOG_SALT_FILE, sale)
+        radice = radice_kdf(sale)
+        CHIAVE_IDENTITA = Fernet(urlsafe_b64encode(
+            sottochiave_hkdf(radice, b"chatdefender-identita")
+        ))
+        return CHIAVE_IDENTITA
+
+
+def registra_messaggio(direzione, peer_ip, testo):
+    MESSAGGI_DIR.mkdir(parents=True, exist_ok=True)
+    ora = datetime.now()
+    cronologia = MESSAGGI_DIR / f"{ora:%Y-%m-%d}.log"
+    riga = f"[{ora:%d/%m/%Y %H:%M:%S}] {direzione} {peer_ip}: {testo}"
+    token = ottieni_chiave_log().encrypt(riga.encode())
+    with open(cronologia, "a") as f:
+        f.write(token.decode() + "\n")
+
+
+def leggi_log():
+    if not MESSAGGI_DIR.exists():
+        print("No messages saved.")
+        return
+    chiave = ottieni_chiave_log()
+    for cronologia in sorted(MESSAGGI_DIR.glob("*.log")):
+        print(f"--- {cronologia.name} ---")
+        scartate = 0
+        for riga in cronologia.read_text().splitlines():
+            try:
+                print(chiave.decrypt(riga.encode()).decode())
+            except (InvalidToken, ValueError):
+                scartate += 1
+        if scartate:
+            print(f"({scartate} lines not decryptable: passphrase changed or old-format log)")
+
+
+def registra_sicurezza(ip, motivo, ban=False):
+    motivo = sanifica(str(motivo)).strip() or "unknown"
+    azione = "ban" if ban else "note"
+    riga = f"{datetime.now():%Y-%m-%d %H:%M:%S} REJECTED ip={ip} reason={motivo} action={azione}\n"
+    try:
+        SECURITY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(SECURITY_LOG, "a") as f:
+            f.write(riga)
+    except OSError:
+        pass
+
+
+def registra_rifiuto(ip):
+    with LOCK_BAN:
+        ora = time.monotonic()
+        tentativi = [t for t in BAN["tentativi"].get(ip, []) if ora - t < DURATA_BAN]
+        tentativi.append(ora)
+        BAN["tentativi"][ip] = tentativi
+        if len(tentativi) >= TENTATIVI_BAN:
+            BAN["scadenze"][ip] = ora + DURATA_BAN
+            BAN["tentativi"].pop(ip, None)
+            return True
+    return False
+
+
+def bannato(ip):
+    with LOCK_BAN:
+        scadenza = BAN["scadenze"].get(ip)
+        if scadenza is None:
+            return False
+        if time.monotonic() >= scadenza:
+            del BAN["scadenze"][ip]
+            return False
+        return True
+
+
+def carica_peer_ip():
+    prepara_cartella_config()
+    if CONFIG_FILE.exists():
+        try:
+            dati = json.loads(CONFIG_FILE.read_text())["peer_ip"]
+            if isinstance(dati, str):
+                return [dati]
+            if isinstance(dati, list) and dati:
+                return [str(x) for x in dati]
+            print("Corrupted configuration, enter it again")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            print("Corrupted configuration, enter it again")
+    ip = input("First setup - IP of the second computer (multiple IPs separated by commas: LAN and/or Tailscale): ").strip()
+    while not ip:
+        ip = input("Invalid IP, try again: ").strip()
+    ip_list = [x.strip() for x in ip.split(",") if x.strip()]
+    CONFIG_FILE.write_text(json.dumps({"peer_ip": ip_list}))
+    os.chmod(CONFIG_FILE, 0o600)
+    print(f"IPs saved to {CONFIG_FILE}: {', '.join(ip_list)}")
+    return ip_list
+
+
+def connetti(peers):
+    ultimo = None
+    for peer in peers:
+        try:
+            return socket.create_connection((peer, PORT), timeout=5)
+        except OSError as e:
+            ultimo = e
+    raise ultimo
+
+
+def carica_password():
+    global PASSWORD_GLOBALE
+    PASSWORD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if PASSWORD_FILE.exists():
+        valore = PASSWORD_FILE.read_text().strip()
+        if valore:
+            PASSWORD_GLOBALE = valore
+            return
+    while True:
+        valore = getpass.getpass("Choose a passphrase (at least 12 characters recommended): ").strip()
+        if not valore:
+            continue
+        if len(valore) < 12:
+            conferma = input("Very short, use it anyway? [y/N]: ").strip().lower()
+            if conferma != "y":
+                continue
+        break
+    scrivi_privato(PASSWORD_FILE, (valore + "\n").encode())
+    PASSWORD_GLOBALE = valore
+    print(f"Passphrase saved to {PASSWORD_FILE} (use the SAME one on the other PC!)")
+
+
+def argon2id(segreto, sale):
+    try:
+        lib = ctypes.CDLL("libargon2.so.1")
+    except OSError:
+        return None
+    lib.argon2id_hash_raw.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    uscita = ctypes.create_string_buffer(32)
+    rc = lib.argon2id_hash_raw(
+        ARGON2_TEMPO,
+        ARGON2_MEMORIA_KIB,
+        ARGON2_PARALLELISMO,
+        segreto,
+        len(segreto),
+        sale,
+        len(sale),
+        uscita,
+        32,
+    )
+    if rc != 0:
+        raise RuntimeError(f"argon2 error {rc}")
+    return uscita.raw
+
+
+def deriva_psk(sale):
+    global AVVISO_KDF
+    metodo = kdf_attivo()
+    chiave = radice_kdf(sale[:16])
+    if metodo != "argon2id" and not AVVISO_KDF:
+        AVVISO_KDF = True
+        avvisa("[!] Handshake using PBKDF2 (the method must be the same on both PCs!)")
+    return chiave
+
+
+def chiave_pubblica_raw(chiave):
+    return chiave.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def impronta(pub_raw):
+    return hashlib.sha256(pub_raw).hexdigest()[:16]
+
+
+def risolvi_pow(sale, bit):
+    base = hashlib.sha256(b"chatdefender-pow" + sale)
+    obiettivo = 1 << (256 - bit)
+    contatore = 0
+    while True:
+        h = base.copy()
+        h.update(contatore.to_bytes(8, "big"))
+        if int.from_bytes(h.digest(), "big") < obiettivo:
+            return contatore.to_bytes(8, "big")
+        contatore += 1
+
+
+def verifica_pow(sale, nonce, bit):
+    obiettivo = 1 << (256 - bit)
+    blocco = b"chatdefender-pow" + sale + nonce
+    return int.from_bytes(hashlib.sha256(blocco).digest(), "big") < obiettivo
+
+
+def ritardo_tarpit(ip):
+    with LOCK_BAN:
+        n = len(BAN["tentativi"].get(ip, []))
+    if n > 0:
+        time.sleep(min(n * 0.5, 3))
+
+
+def carica_identita():
+    prepara_cartella_config()
+    if IDENTITY_FILE.exists():
+        dati = IDENTITY_FILE.read_bytes().strip()
+        chiave_id = ottieni_chiave_identita()
+        try:
+            privata = chiave_id.decrypt(dati)
+        except InvalidToken:
+            privata = riallinea_identita(dati)
+        if privata is None:
+            try:
+                candidata = urlsafe_b64decode(dati)
+            except Exception:
+                candidata = b""
+            if len(candidata) == 32:
+                print("Identity found in plaintext: encrypting it with the passphrase")
+                privata = candidata
+                scrivi_privato(IDENTITY_FILE, chiave_id.encrypt(privata) + b"\n")
+            else:
+                raise SystemExit(
+                    "Cannot read identity: different passphrase than the one used to encrypt it?\n"
+                    "Restore the correct passphrase, or delete identity.key "
+                    "(the peer will need to re-learn your new fingerprint)"
+                )
+        return X25519PrivateKey.from_private_bytes(privata)
+    identita = X25519PrivateKey.generate()
+    privata_raw = identita.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    scrivi_privato(IDENTITY_FILE, ottieni_chiave_identita().encrypt(privata_raw) + b"\n")
+    print(f"Generated permanent encrypted identity: {impronta(chiave_pubblica_raw(identita))}")
+    return identita
+
+
+def verifica_peer(pub_raw):
+    PEER_IDENTITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not PEER_IDENTITY_FILE.exists():
+        scrivi_privato(PEER_IDENTITY_FILE, pub_raw)
+        print(f"New peer stored (fingerprint {impronta(pub_raw)})")
+        return
+    if PEER_IDENTITY_FILE.read_bytes() != pub_raw:
+        raise ValueError("peer identity differs from the usual one")
+
+
+def scambio_chiavi(sock, identita, iniziatore):
+    effimero = X25519PrivateKey.generate()
+    mio = bytes([VERSIONE_PROTOCOLLO]) + chiave_pubblica_raw(effimero) + chiave_pubblica_raw(identita)
+    sock.sendall(struct.pack(">I", len(mio)) + mio)
+    primo = recvall(sock, 4)
+    if primo.startswith(b"ERR") or primo.startswith(b"OK"):
+        motivo = primo.decode(errors="replace").strip()
+        raise ValueError(f"rejection from peer before handshake ({motivo}): server busy or old version")
+    lun = struct.unpack(">I", primo)[0]
+    if lun == 64:
+        raise ValueError("peer running an old version: update Veil on the other PC")
+    if lun != 65:
+        raise ValueError("invalid handshake")
+    ricevuto = recvall(sock, lun)
+    if ricevuto[0] != VERSIONE_PROTOCOLLO:
+        raise ValueError(f"protocol version {ricevuto[0]} differs from ours ({VERSIONE_PROTOCOLLO}): align the versions on both PCs")
+    altrui_eff = X25519PublicKey.from_public_bytes(ricevuto[1:33])
+    altrui_ident = X25519PublicKey.from_public_bytes(ricevuto[33:])
+    verifica_peer(ricevuto[33:])
+    if iniziatore:
+        pacchetto = recvall(sock, 4)
+        if struct.unpack(">I", pacchetto)[0] != 17:
+            raise ValueError("invalid proof-of-work challenge")
+        sfida = recvall(sock, 16)
+        difficolta = recvall(sock, 1)[0]
+        if not 8 <= difficolta <= 26:
+            raise ValueError("absurd proof-of-work difficulty")
+        nonce = risolvi_pow(sfida, difficolta)
+        sock.sendall(struct.pack(">I", 8) + nonce)
+    else:
+        sfida = os.urandom(16)
+        sock.sendall(struct.pack(">I", 17) + sfida + bytes([DIFFICOLTA_POW]))
+        lun_nonce = struct.unpack(">I", recvall(sock, 4))[0]
+        if lun_nonce != 8:
+            raise ValueError("invalid proof-of-work solution")
+        nonce = recvall(sock, 8)
+        if not verifica_pow(sfida, nonce, DIFFICOLTA_POW):
+            raise ValueError("proof-of-work not solved")
+    if iniziatore:
+        trascrizione_proprio = b"I" + mio + ricevuto
+        trascrizione_peer = b"R" + mio + ricevuto
+    else:
+        trascrizione_proprio = b"R" + ricevuto + mio
+        trascrizione_peer = b"I" + ricevuto + mio
+    sale = mio[:32] if iniziatore else ricevuto[:32]
+    chiave_psk = deriva_psk(sale)
+    mac_mio = hmac.new(chiave_psk, trascrizione_proprio, hashlib.sha256).digest()
+    sock.sendall(mac_mio)
+    mac_altrui = recvall(sock, 32)
+    mac_atteso = hmac.new(chiave_psk, trascrizione_peer, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac_altrui, mac_atteso):
+        raise ValueError("wrong passphrase, different KDFs on the two PCs, or interference")
+    segreto = effimero.exchange(altrui_eff) + identita.exchange(altrui_ident)
+    if iniziatore:
+        trascrizione = mio + ricevuto
+        mac_ordinati = mac_mio + mac_altrui
+    else:
+        trascrizione = ricevuto + mio
+        mac_ordinati = mac_altrui + mac_mio
+    chiave = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"chatdefender-handshake" + trascrizione + mac_ordinati,
+    ).derive(segreto)
+    return Fernet(urlsafe_b64encode(chiave))
+
+
+def recvall(conn, n):
+    buf = b""
+    while len(buf) < n:
+        blocco = conn.recv(min(BUFFER_SIZE, n - len(buf)))
+        if not blocco:
+            raise ConnectionError("connection interrupted")
+        buf += blocco
+    return buf
+
+
+def imballa_messaggio(dati):
+    obiettivo = len(dati) + 4
+    for soglia in PADDING_SOGLIE:
+        if len(dati) + 4 <= soglia:
+            obiettivo = soglia
+            break
+    return len(dati).to_bytes(4, "big") + dati + os.urandom(obiettivo - 4 - len(dati))
+
+
+def invia_payload(sock, fernet, meta, payload_path=None, testo=None):
+    if payload_path is not None:
+        size = payload_path.stat().st_size
+        meta = {**meta, "size": size}
+        sorgente = open(payload_path, "rb")
+    else:
+        dati = imballa_messaggio(testo.encode())
+        size = len(dati)
+        meta = {**meta, "size": size}
+        sorgente = None
+
+    header = fernet.encrypt(json.dumps(meta).encode())
+    sock.sendall(header + b"\n")
+
+    try:
+        if sorgente is not None:
+            with sorgente:
+                while chunk := sorgente.read(CHUNK_SIZE):
+                    token = fernet.encrypt(chunk)
+                    sock.sendall(struct.pack(">I", len(token)) + token)
+        else:
+            token = fernet.encrypt(dati)
+            sock.sendall(struct.pack(">I", len(token)) + token)
+    except BrokenPipeError:
+        raise ConnectionError("the peer closed the connection")
+
+
+def send_file(percorso, peers, identita):
+    src = Path(percorso.strip().strip('"').strip("'")).expanduser()
+    if not src.is_file():
+        print("File not found")
+        return
+    DROP_DIR.mkdir(exist_ok=True)
+    destinazione_locale = DROP_DIR / src.name
+    if src.resolve() != destinazione_locale.resolve():
+        shutil.copy2(src, destinazione_locale)
+    try:
+        with connetti(peers) as sock:
+            sock.settimeout(SOCKET_TIMEOUT)
+            fernet = scambio_chiavi(sock, identita, iniziatore=True)
+            invia_payload(sock, fernet, {"type": "file", "filename": src.name}, payload_path=src)
+            risposta = ricevi_risposta(sock)
+        if risposta.startswith(b"OK"):
+            print("File share successful (encrypted)")
+        elif not risposta:
+            print("The peer closed the connection without responding")
+        else:
+            print(f"Share failed: {risposta.decode(errors='replace')}")
+    except TimeoutError:
+        print("Timeout: the peer did not respond (is it on? updated version?)")
+    except ConnectionRefusedError:
+        print(f"No one answers on {', '.join(peers)}:{PORT}: is Veil running on the other PC?")
+    except ValueError as e:
+        print(f"Connection rejected by the peer: {e}")
+    except ConnectionError:
+        print("The peer interrupted the connection during transfer")
+    except OSError as e:
+        print(f"Cannot reach the peer {', '.join(peers)} ({e})")
+
+
+def send_message(testo, peers, identita):
+    if len(testo.encode()) > MAX_MSG_SIZE:
+        print("Message too long: the maximum is 1 MB")
+        return
+    try:
+        with connetti(peers) as sock:
+            sock.settimeout(SOCKET_TIMEOUT)
+            fernet = scambio_chiavi(sock, identita, iniziatore=True)
+            invia_payload(sock, fernet, {"type": "msg"}, testo=testo)
+            risposta = ricevi_risposta(sock)
+        if risposta.startswith(b"OK"):
+            registra_messaggio("inviato a", peers[0], testo)
+            print("Message sent (encrypted)")
+        elif not risposta:
+            print("The peer closed the connection without responding")
+        else:
+            print(f"Send failed: {risposta.decode(errors='replace')}")
+    except TimeoutError:
+        print("Timeout: the peer did not respond (is it on? updated version?)")
+    except ConnectionRefusedError:
+        print(f"No one answers on {', '.join(peers)}:{PORT}: is Veil running on the other PC?")
+    except ValueError as e:
+        print(f"Connection rejected by the peer: {e}")
+    except ConnectionError:
+        print("The peer interrupted the connection during transfer")
+    except OSError as e:
+        print(f"Cannot reach the peer {', '.join(peers)} ({e})")
+
+
+def gestisci_connessione(conn, addr, consentiti, identita):
+    with conn:
+        if bannato(addr[0]):
+            registra_sicurezza(addr[0], "connessione-da-ip-bannato", ban=True)
+            avvisa(f"[⛔] Connection from {addr[0]} rejected: IP banned")
+            return
+        if addr[0] not in consentiti:
+            registra_rifiuto(addr[0])
+            registra_sicurezza(addr[0], "ip-non-autorizzato", ban=True)
+            avvisa(f"[🚨] INTRUDER: {addr[0]} tried to connect (only {', '.join(consentiti)} allowed), connection closed")
+            return
+        try:
+            conn.settimeout(TIMEOUT_PRE_AUTH)
+            if not SEM_HANDSHAKE.acquire(timeout=15):
+                registra_sicurezza(addr[0], "server-occupato-troppi-handshake")
+                conn.sendall(b"ERR server busy, try again shortly\n")
+                return
+            try:
+                fernet = scambio_chiavi(conn, identita, iniziatore=False)
+            finally:
+                SEM_HANDSHAKE.release()
+            conn.settimeout(SOCKET_TIMEOUT)
+            riga = b""
+            while b"\n" not in riga:
+                buf = conn.recv(4096)
+                if not buf:
+                    return
+                riga += buf
+                if len(riga) > MAX_CHUNK_TOKEN:
+                    conn.sendall(b"ERR header too large\n")
+                    return
+            header_token, avanzati = riga.split(b"\n", 1)
+            meta = json.loads(fernet.decrypt(header_token))
+
+            in_sospeso = bytearray(avanzati)
+
+            def leggi_esatti(n):
+                while len(in_sospeso) < n:
+                    blocco = conn.recv(min(BUFFER_SIZE, n - len(in_sospeso)))
+                    if not blocco:
+                        raise ConnectionError("connection interrupted")
+                    in_sospeso.extend(blocco)
+                dati = bytes(in_sospeso[:n])
+                del in_sospeso[:n]
+                return dati
+
+            tipo = meta.get("type")
+            dimensione = int(meta["size"])
+            limite = MAX_MSG_SIZE + 4 if tipo == "msg" else 10 * 1024**3
+            if tipo not in ("file", "msg") or dimensione < 0 or dimensione > limite:
+                conn.sendall(b"ERR invalid request\n")
+                return
+
+            ricevuti = 0
+            contenuto = bytearray() if tipo == "msg" else None
+            if tipo == "file":
+                nome = sanifica(Path(meta["filename"]).name).strip()
+                if not nome or nome in (".", ".."):
+                    conn.sendall(b"ERR invalid request\n")
+                    return
+                DROP_DIR.mkdir(exist_ok=True)
+                destinazione = DROP_DIR / nome
+                progressivo = 1
+                while destinazione.exists():
+                    destinazione = DROP_DIR / f"{Path(nome).stem}-{progressivo}{Path(nome).suffix}"
+                    progressivo += 1
+                out = open(destinazione, "wb")
+            else:
+                out = None
+
+            trasferito = False
+            try:
+                while ricevuti < dimensione:
+                    lun = struct.unpack(">I", leggi_esatti(4))[0]
+                    if lun == 0 or lun > MAX_CHUNK_TOKEN:
+                        raise ValueError("chunk non valido")
+                    pezzo = fernet.decrypt(leggi_esatti(lun))
+                    if ricevuti + len(pezzo) > dimensione:
+                        raise ValueError("payload piu' grande del dichiarato")
+                    if out:
+                        out.write(pezzo)
+                    else:
+                        contenuto += pezzo
+                    ricevuti += len(pezzo)
+                trasferito = True
+            finally:
+                if out:
+                    out.close()
+                    if not trasferito:
+                        destinazione.unlink(missing_ok=True)
+                        avvisa(f"[!] Incomplete transfer, partial file '{destinazione.name}' deleted")
+
+            conn.sendall(b"OK\n")
+            if tipo == "file":
+                avvisa(f"[+] Received '{destinazione.name}' from {addr[0]} ({dimensione} bytes, encrypted)")
+            else:
+                n = int.from_bytes(contenuto[:4], "big")
+                if 4 + n > len(contenuto):
+                    raise ValueError("messaggio corrotto (padding non valido)")
+                testo = sanifica(contenuto[4:4 + n].decode("utf-8", errors="replace"))
+                registra_messaggio("ricevuto da", addr[0], testo)
+                avvisa(f"[💬] Message from {addr[0]}: {testo}")
+        except InvalidToken:
+            ritardo_tarpit(addr[0])
+            if registra_rifiuto(addr[0]):
+                avvisa(f"[⛔] {addr[0]} banned for {DURATA_BAN // 60} minutes")
+            registra_sicurezza(addr[0], "invalid-data-or-different-key")
+            rispondi_err(conn)
+            avvisa(f"[!] Invalid data or different key ({addr[0]}), connection rejected")
+        except ValueError as e:
+            ritardo_tarpit(addr[0])
+            if registra_rifiuto(addr[0]):
+                avvisa(f"[⛔] {addr[0]} banned for {DURATA_BAN // 60} minutes")
+            registra_sicurezza(addr[0], str(e))
+            rispondi_err(conn)
+            avvisa(f"[🚨] Connection rejected from {addr[0]}: {e}")
+        except TimeoutError:
+            registra_sicurezza(addr[0], "timeout")
+            rispondi_err(conn)
+            avvisa(f"[!] Timed out ({addr[0]}), connection closed")
+        except (json.JSONDecodeError, KeyError, TypeError, ConnectionError, OSError):
+            registra_sicurezza(addr[0], "invalid-transfer")
+            rispondi_err(conn)
+
+
+def rispondi_err(conn):
+    try:
+        conn.sendall(b"ERR invalid transfer\n")
+    except OSError:
+        pass
+
+
+def ricevi_risposta(sock):
+    buf = b""
+    while not buf.endswith(b"\n") and len(buf) < 64:
+        pezzo = sock.recv(64 - len(buf))
+        if not pezzo:
+            break
+        buf += pezzo
+    return buf.strip()
+
+
+def ricevi_loop(consentiti, identita):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("0.0.0.0", PORT))
+            server.listen()
+            while True:
+                conn, addr = server.accept()
+                threading.Thread(target=gestisci_connessione, args=(conn, addr, consentiti, identita), daemon=True).start()
+    except OSError as e:
+        avvisa(f"[!] Cannot listen on port {PORT} ({e}): is another instance already running?")
+
+
+def migra_kdf(nuovo):
+    carica_password()
+    vecchio = kdf_attivo()
+    if vecchio == nuovo:
+        print(f"KDF already set to {nuovo}, nothing to do")
+        return
+    prepara_cartella_config()
+    sale = LOG_SALT_FILE.read_bytes() if LOG_SALT_FILE.exists() else os.urandom(16)
+    radice_vecchia = radice_kdf(sale)
+    fernet_log_vecchio = Fernet(urlsafe_b64encode(radice_vecchia))
+    chiave_ident_vecchia = Fernet(urlsafe_b64encode(sottochiave_hkdf(radice_vecchia, b"chatdefender-identita")))
+    privata_raw = None
+    if IDENTITY_FILE.exists():
+        dati = IDENTITY_FILE.read_bytes().strip()
+        try:
+            privata_raw = chiave_ident_vecchia.decrypt(dati)
+        except InvalidToken:
+            candidata = urlsafe_b64decode(dati)
+            if len(candidata) == 32:
+                privata_raw = candidata
+        if privata_raw is None:
+            raise SystemExit("Identity unreadable with the current setup: migration cancelled")
+    scrivi_privato(KDF_FILE, (nuovo + "\n").encode())
+    global CHIAVE_LOG, CHIAVE_IDENTITA
+    CHIAVE_LOG = None
+    CHIAVE_IDENTITA = None
+    scrivi_privato(IDENTITY_FILE, ottieni_chiave_identita().encrypt(privata_raw) + b"\n")
+    print(f"Identity re-encrypted with {nuovo}")
+    if MESSAGGI_DIR.exists():
+        lasciate = 0
+        nuovo_fernet = ottieni_chiave_log()
+        for cronologia in sorted(MESSAGGI_DIR.glob("*.log")):
+            uscita = []
+            for riga in cronologia.read_text().splitlines():
+                try:
+                    uscita.append(nuovo_fernet.encrypt(fernet_log_vecchio.decrypt(riga.encode())).decode())
+                except (InvalidToken, ValueError):
+                    uscita.append(riga)
+                    lasciate += 1
+            scrivi_privato(cronologia, ("\n".join(uscita) + "\n").encode())
+        if lasciate:
+            print(f"[!] {lasciate} lines not re-encrypted, left as they were")
+        print(f"Logs re-encrypted with {nuovo}")
+    print(f"Active KDF now: {nuovo} (the other PC must use the same method for the handshake)")
+
+
+def cambia_password():
+    banner()
+    carica_password()
+    print("Changing passphrase: logs and identity will be re-encrypted under the new phrase.")
+    while True:
+        nuova = getpass.getpass("New passphrase (at least 12 characters): ").strip()
+        if not nuova:
+            continue
+        if len(nuova) < 12:
+            if input("Very short, use it anyway? [y/N]: ").strip().lower() != "y":
+                continue
+        if getpass.getpass("Repeat the new passphrase: ").strip() != nuova:
+            print("They differ, try again")
+            continue
+        break
+    prepara_cartella_config()
+    sale_vecchio = LOG_SALT_FILE.read_bytes() if LOG_SALT_FILE.exists() else os.urandom(16)
+    radice_vecchia = radice_kdf(sale_vecchio)
+    fernet_log_vecchio = Fernet(urlsafe_b64encode(radice_vecchia))
+    chiave_ident_vecchia = Fernet(urlsafe_b64encode(sottochiave_hkdf(radice_vecchia, b"chatdefender-identita")))
+    privata_raw = None
+    if IDENTITY_FILE.exists():
+        dati = IDENTITY_FILE.read_bytes().strip()
+        try:
+            privata_raw = chiave_ident_vecchia.decrypt(dati)
+        except InvalidToken:
+            candidata = urlsafe_b64decode(dati)
+            if len(candidata) == 32:
+                privata_raw = candidata
+        if privata_raw is None:
+            raise SystemExit("Identity unreadable with the current passphrase: change cancelled")
+    global PASSWORD_GLOBALE, CHIAVE_LOG, CHIAVE_IDENTITA
+    scrivi_privato(PASSWORD_FILE, (nuova + "\n").encode())
+    PASSWORD_GLOBALE = nuova
+    scrivi_privato(LOG_SALT_FILE, os.urandom(16))
+    CHIAVE_LOG = None
+    CHIAVE_IDENTITA = None
+    if privata_raw is not None:
+        scrivi_privato(IDENTITY_FILE, ottieni_chiave_identita().encrypt(privata_raw) + b"\n")
+        print("Identity re-encrypted")
+    if MESSAGGI_DIR.exists():
+        lasciate = 0
+        nuovo_fernet = ottieni_chiave_log()
+        for cronologia in sorted(MESSAGGI_DIR.glob("*.log")):
+            uscita = []
+            for riga in cronologia.read_text().splitlines():
+                try:
+                    uscita.append(nuovo_fernet.encrypt(fernet_log_vecchio.decrypt(riga.encode())).decode())
+                except (InvalidToken, ValueError):
+                    uscita.append(riga)
+                    lasciate += 1
+            scrivi_privato(cronologia, ("\n".join(uscita) + "\n").encode())
+        if lasciate:
+            print(f"[!] {lasciate} lines not re-encrypted (old format or corrupted), left as they were")
+        print("Message logs re-encrypted")
+    print("Passphrase changed! Use the SAME one on the other PC too, otherwise you will no longer connect")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="End-to-end encrypted chat and file sharing over LAN")
+    parser.add_argument("--read-log", action="store_true", help="show saved messages (decrypted)")
+    parser.add_argument("--change-password", action="store_true", help="change the passphrase, re-encrypting logs and identity")
+    parser.add_argument("--migrate-kdf", choices=["argon2id", "pbkdf2"], help="convert local files to a different KDF")
+    args = parser.parse_args()
+    if args.read_log:
+        carica_password()
+        leggi_log()
+        return
+    if args.change_password:
+        cambia_password()
+        return
+    if args.migrate_kdf:
+        migra_kdf(args.migrate_kdf)
+        return
+
+    banner()
+    DROP_DIR.mkdir(exist_ok=True)
+    peers = carica_peer_ip()
+    carica_password()
+    identita = carica_identita()
+    if PEER_IDENTITY_FILE.exists() and sys.stdin.isatty():
+        impronta_attuale = impronta(PEER_IDENTITY_FILE.read_bytes())
+        conferma = input(
+            f"Stored peer fingerprint: {impronta_attuale}\n"
+            "Compare it with the other PC: do you confirm it? [Y/n]: "
+        ).strip().lower()
+        if conferma == "n":
+            PEER_IDENTITY_FILE.unlink()
+            raise SystemExit("Pin deleted: it will be remembered again at the next connection. Re-verify the fingerprint in person!")
+    print("Handshake key derivation:", kdf_attivo())
+    print(f"Anti-flood: {DIFFICOLTA_POW}-bit proof-of-work, mini-ban after {TENTATIVI_BAN} rejections")
+    if PEER_IDENTITY_FILE.exists():
+        print(f"Stored peer fingerprint: {impronta(PEER_IDENTITY_FILE.read_bytes())} (verify it in person with the other PC)")
+    threading.Thread(target=ricevi_loop, args=(peers, identita), daemon=True).start()
+    print(f"Listening on port {PORT} | Shared folder: {DROP_DIR} | History: {MESSAGGI_DIR}")
+    print('Type the path of a file to share, or any message (quotes optional): hello or "hello"')
+    print("(q to quit)\n")
+    attiva_input_raw()
+    try:
+        while True:
+            try:
+                scelta = leggi_riga()
+            except (KeyboardInterrupt, EOFError):
+                print("\nBye!")
+                break
+            if not elabora(scelta, peers, identita):
+                break
+    finally:
+        ripristina_input()
+
+
+def elabora(riga, peers, identita):
+    pulito = riga.strip()
+    if pulito.lower() in ("q", "quit", "exit"):
+        return False
+    if not pulito:
+        return True
+    senza_virgolette = pulito
+    if len(pulito) >= 2 and pulito[0] == pulito[-1] and pulito[0] in "\"'":
+        senza_virgolette = pulito[1:-1]
+    try:
+        esiste = Path(senza_virgolette).expanduser().is_file()
+    except OSError:
+        esiste = False
+    if esiste:
+        send_file(senza_virgolette, peers, identita)
+        return True
+    if pulito[0] in "\"'":
+        q = pulito[0]
+        corpo = pulito[1:]
+        if corpo.endswith(q):
+            corpo = corpo[:-1]
+        if corpo.strip():
+            send_message(corpo, peers, identita)
+    elif "/" in pulito or pulito.startswith("~"):
+        print("File not found")
+    else:
+        send_message(pulito, peers, identita)
+    return True
+
+
+if __name__ == "__main__":
+    main()
